@@ -9,7 +9,12 @@ def stream_response(stream_info):
     stream_url = stream_info.get("record_url") or stream_info.get("m3u8_url") or stream_info.get("flv_url")
     if not stream_url:
         raise RuntimeError("live room has no usable stream URL")
-    return {"streamUrl": stream_url}
+    response = {"streamUrl": stream_url}
+    if stream_info.get("anchor_name"):
+        response["streamerName"] = stream_info["anchor_name"]
+    if stream_info.get("title"):
+        response["title"] = stream_info["title"]
+    return response
 
 
 def resolve_stream(platform, url, quality="OD", proxy_addr="", cookies=""):
