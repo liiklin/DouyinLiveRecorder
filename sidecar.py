@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import configparser
 import json
 
 
@@ -31,16 +32,32 @@ def resolve_stream(platform, url, quality="OD", proxy_addr="", cookies=""):
     return stream_response(stream_info)
 
 
+def config_credentials(config_path, platform):
+    if not config_path:
+        return "OD", ""
+    config = configparser.ConfigParser()
+    config.read(config_path, encoding="utf-8-sig")
+    settings = config["录制设置"] if "录制设置" in config else {}
+    quality_label = settings.get("原画|超清|高清|标清|流畅", "原画")
+    quality = {"原画": "OD", "超清": "UHD", "高清": "HD", "标清": "SD", "流畅": "LD"}.get(quality_label, "OD")
+    cookies = config["Cookie"].get("抖音cookie" if platform == "douyin" else "快手cookie", "") if "Cookie" in config else ""
+    return quality, cookies
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("resolve-stream")
     parser.add_argument("--platform", choices=("douyin", "kuaishou"), required=True)
     parser.add_argument("--url", required=True)
-    parser.add_argument("--quality", default="OD")
+    parser.add_argument("--quality", default="")
     parser.add_argument("--proxy-addr", default="")
     parser.add_argument("--cookies", default="")
+    parser.add_argument("--config", default="")
     args = parser.parse_args()
-    print(json.dumps(resolve_stream(args.platform, args.url, args.quality, args.proxy_addr, args.cookies), ensure_ascii=False))
+    config_quality, config_cookies = config_credentials(args.config, args.platform)
+    quality = args.quality or config_quality
+    cookies = args.cookies or config_cookies
+    print(json.dumps(resolve_stream(args.platform, args.url, quality, args.proxy_addr, cookies), ensure_ascii=False))
 
 
 if __name__ == "__main__":
