@@ -2,6 +2,30 @@ import argparse
 import asyncio
 import configparser
 import json
+import re
+import sys
+
+# Packaged (PyInstaller) executables on Windows default stdout to the system
+# locale (e.g. GBK), which cannot encode non-BMP or emoji characters found in
+# streamer names/titles. The Go host always reads UTF-8, so force it here.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (ValueError, OSError):
+            pass
+
+
+def normalize_douyin_url(url: str) -> str:
+    """Normalize Douyin room URLs that are not plain live.douyin.com links.
+
+    Follow-page live links like www.douyin.com/follow/live/{room_id}?anchor_id=...
+    embed the room id in the path; the web API requires a live.douyin.com URL.
+    """
+    follow_match = re.match(r"https?://(?:www\.)?douyin\.com/follow/live/(\d+)", url)
+    if follow_match:
+        return f"https://live.douyin.com/{follow_match.group(1)}"
+    return url
 
 
 def stream_response(stream_info):
@@ -22,13 +46,19 @@ def resolve_stream(platform, url, quality="OD", proxy_addr="", cookies=""):
     from src import spider, stream
 
     if platform == "douyin":
-        data = asyncio.run(spider.get_douyin_web_stream_data(url=url, proxy_addr=proxy_addr, cookies=cookies))
+        url = normalize_douyin_url(url)
+        if "v.douyin.com" not in url and "/user/" not in url:
+            data = asyncio.run(spider.get_douyin_web_stream_data(url=url, proxy_addr=proxy_addr, cookies=cookies))
+        else:
+            data = asyncio.run(spider.get_douyin_app_stream_data(url=url, proxy_addr=proxy_addr, cookies=cookies))
         stream_info = asyncio.run(stream.get_douyin_stream_url(data, quality, proxy_addr))
     elif platform == "kuaishou":
         data = asyncio.run(spider.get_kuaishou_stream_data(url=url, proxy_addr=proxy_addr, cookies=cookies))
         stream_info = asyncio.run(stream.get_kuaishou_stream_url(data, quality))
     else:
         raise RuntimeError(f"unsupported platform: {platform}")
+    if not stream_info.get("is_live") and not stream_info.get("anchor_name"):
+        raise RuntimeError("failed to resolve live stream (possibly invalid cookies or URL)")
     return stream_response(stream_info)
 
 
