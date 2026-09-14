@@ -16,25 +16,120 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 
-def normalize_douyin_url(url: str) -> str:
-    """Normalize Douyin room URLs that are not plain live.douyin.com links.
+# stdout carries exactly one protocol JSON line. The Go host spawns this script
+# with a combined-output reader, and the vendored resolver library prints
+# diagnostics to stdout on several failure paths; those prints are forwarded to
+# stderr here so they can never corrupt the protocol line.
+PROTOCOL_STDOUT = sys.stdout
 
-    Follow-page live links like www.douyin.com/follow/live/{room_id}?anchor_id=...
-    embed the room id in the path; the web API requires a live.douyin.com URL.
+STATE_LIVE = "live"
+STATE_OFFLINE = "offline"
+STATE_ERROR = "error"
+
+EXIT_OK = 0
+EXIT_FAILURE = 1
+
+# live.douyin.com/<web_rid> embeds the 12-digit web_rid the web enter endpoint
+# expects, while follow-page links (www.douyin.com/follow/live/<id>) and app
+# share links embed the 19-digit room_id, which that endpoint rejects with
+# status_code 4001038.
+DOUYIN_WEB_RID_MAX_DIGITS = 15
+
+
+class _DiagnosticsStream:
+    """Forwards library prints to stderr so stdout stays protocol-only."""
+
+    def __init__(self, target):
+        self._target = target
+
+    def write(self, text):
+        if self._target is None:
+            return len(text)
+        return self._target.write(text)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        if self._target is None:
+            return
+        try:
+            self._target.flush()
+        except (ValueError, OSError):
+            pass
+
+    def isatty(self):
+        return False
+
+    def reconfigure(self, **_kwargs):
+        return None
+
+    def __getattr__(self, name):
+        return getattr(self._target, name)
+
+
+sys.stdout = _DiagnosticsStream(sys.stderr)
+
+
+class RoomOffline(RuntimeError):
+    """The platform was reached and reported that the room is not live.
+
+    This is a normal monitoring state rather than a resolver failure: the host
+    keeps polling and starts recording once the room goes live. Streamer
+    metadata is carried along so the report stays useful.
     """
-    follow_match = re.match(r"https?://(?:www\.)?douyin\.com/follow/live/(\d+)", url)
+
+    def __init__(self, message="room is not live", stream_info=None):
+        super().__init__(message)
+        info = stream_info or {}
+        self.streamer_name = info.get("anchor_name") or ""
+        self.title = info.get("title") or ""
+
+    def payload(self):
+        return {
+            "state": STATE_OFFLINE,
+            "message": str(self),
+            "streamerName": self.streamer_name,
+            "title": self.title,
+        }
+
+
+def _douyin_digits_kind(digits):
+    if len(digits) > DOUYIN_WEB_RID_MAX_DIGITS:
+        return "room_id", digits
+    return "web_rid", digits
+
+
+def douyin_room_reference(url):
+    """Classify a Douyin link into ("web_rid"|"room_id"|"app", value)."""
+    text = (url or "").strip()
+    follow_match = re.search(r"https?://(?:www\.)?douyin\.com/follow/live/(\d+)", text)
     if follow_match:
-        return f"https://live.douyin.com/{follow_match.group(1)}"
-    return url
+        return _douyin_digits_kind(follow_match.group(1))
+    live_match = re.search(r"https?://live\.douyin\.com/(\d+)", text)
+    if live_match:
+        return _douyin_digits_kind(live_match.group(1))
+    # App share links (v.douyin.com/...) and profile links (douyin.com/user/...)
+    # are resolved through the app endpooints by the resolver itself.
+    return "app", text
+
+
+def normalize_douyin_url(url):
+    """Return the bare room reference for links that are not plain room URLs."""
+    kind, value = douyin_room_reference(url)
+    if kind == "app":
+        return url
+    return f"https://live.douyin.com/{value}"
 
 
 def stream_response(stream_info):
     if not stream_info.get("is_live"):
-        raise RuntimeError("room is not live")
+        raise RoomOffline("room is not live", stream_info)
     stream_url = stream_info.get("record_url") or stream_info.get("m3u8_url") or stream_info.get("flv_url")
     if not stream_url:
         raise RuntimeError("live room has no usable stream URL")
-    response = {"streamUrl": stream_url}
+    response = {"state": STATE_LIVE, "streamUrl": stream_url}
     if stream_info.get("anchor_name"):
         response["streamerName"] = stream_info["anchor_name"]
     if stream_info.get("title"):
@@ -46,11 +141,16 @@ def resolve_stream(platform, url, quality="OD", proxy_addr="", cookies=""):
     from src import spider, stream
 
     if platform == "douyin":
-        url = normalize_douyin_url(url)
-        if "v.douyin.com" not in url and "/user/" not in url:
-            data = asyncio.run(spider.get_douyin_web_stream_data(url=url, proxy_addr=proxy_addr, cookies=cookies))
+        kind, value = douyin_room_reference(url)
+        if kind == "room_id":
+            data = asyncio.run(spider.get_douyin_app_stream_data_by_room_id(
+                room_id=value, proxy_addr=proxy_addr, cookies=cookies))
+        elif kind == "web_rid":
+            data = asyncio.run(spider.get_douyin_web_stream_data(
+                url=f"https://live.douyin.com/{value}", proxy_addr=proxy_addr, cookies=cookies))
         else:
-            data = asyncio.run(spider.get_douyin_app_stream_data(url=url, proxy_addr=proxy_addr, cookies=cookies))
+            data = asyncio.run(spider.get_douyin_app_stream_data(
+                url=value, proxy_addr=proxy_addr, cookies=cookies))
         stream_info = asyncio.run(stream.get_douyin_stream_url(data, quality, proxy_addr))
     elif platform == "kuaishou":
         data = asyncio.run(spider.get_kuaishou_stream_data(url=url, proxy_addr=proxy_addr, cookies=cookies))
@@ -74,7 +174,12 @@ def config_credentials(config_path, platform):
     return quality, cookies
 
 
-def main():
+def error_message(exc):
+    message = str(exc).strip()
+    return message or exc.__class__.__name__
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("resolve-stream")
     parser.add_argument("--platform", choices=("douyin", "kuaishou"), required=True)
@@ -83,12 +188,22 @@ def main():
     parser.add_argument("--proxy-addr", default="")
     parser.add_argument("--cookies", default="")
     parser.add_argument("--config", default="")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     config_quality, config_cookies = config_credentials(args.config, args.platform)
     quality = args.quality or config_quality
     cookies = args.cookies or config_cookies
-    print(json.dumps(resolve_stream(args.platform, args.url, quality, args.proxy_addr, cookies), ensure_ascii=False))
+    try:
+        payload = resolve_stream(args.platform, args.url, quality, args.proxy_addr, cookies)
+    except RoomOffline as exc:
+        print(json.dumps(exc.payload(), ensure_ascii=False), file=PROTOCOL_STDOUT)
+        return EXIT_OK
+    except Exception as exc:  # noqa: BLE001 - single-line protocol error, no traceback
+        print(json.dumps({"state": STATE_ERROR, "message": error_message(exc)}, ensure_ascii=False),
+              file=PROTOCOL_STDOUT)
+        return EXIT_FAILURE
+    print(json.dumps(payload, ensure_ascii=False), file=PROTOCOL_STDOUT)
+    return EXIT_OK
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
