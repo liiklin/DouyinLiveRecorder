@@ -43,6 +43,33 @@ class SidecarTest(unittest.TestCase):
         for url, expected in cases.items():
             self.assertEqual(sidecar.douyin_room_reference(url), expected, url)
 
+    def test_classifies_douyin_live_path_variants(self):
+        cases = {
+            "https://live.douyin.com/499355244796": ("web_rid", "499355244796"),
+            "https://www.douyin.com/root/live/795838110856?anchor_id=3729194550826920&is_aweme_tied=1": ("web_rid", "795838110856"),
+            "https://www.douyin.com/root/live/7685183051802151680?anchor_id=1": ("room_id", "7685183051802151680"),
+            "https://www.douyin.com/follow/live/7685183051802151680?anchor_id=1": ("room_id", "7685183051802151680"),
+            "https://webcast.amemv.com/webcast/room/reflow/info/?room_id=7685183051802151680&sec_user_id=": ("room_id", "7685183051802151680"),
+            "https://live.douyin.com/?live_web_rid=41421297272": ("web_rid", "41421297272"),
+            "https://live.douyin.com/?live_web_rid=7685183051802151680": ("room_id", "7685183051802151680"),
+            "https://v.douyin.com/iRnBho6u/": ("app", "https://v.douyin.com/iRnBho6u/"),
+        }
+
+        for url, expected in cases.items():
+            self.assertEqual(sidecar.douyin_room_reference(url), expected, url)
+
+    def test_extracts_reflow_reference_without_sec_user_id(self):
+        from src.room import extract_reflow_reference
+
+        self.assertEqual(
+            extract_reflow_reference("https://webcast.amemv.com/webcast/room/reflow/info/?room_id=795838110856&anchor_id=1"),
+            ("795838110856", ""),
+        )
+        self.assertEqual(
+            extract_reflow_reference("https://webcast.amemv.com/webcast/room/reflow/info/7685183051802151680?sec_user_id=MS4wLjABAAAA-x&from=share"),
+            ("7685183051802151680", "MS4wLjABAAAA-x"),
+        )
+
     def test_normalize_douyin_url_returns_bare_room_reference(self):
         self.assertEqual(
             sidecar.normalize_douyin_url("https://www.douyin.com/follow/live/7685183051802151680?anchor_id=1"),

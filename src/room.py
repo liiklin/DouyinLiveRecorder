@@ -48,6 +48,24 @@ async def get_xbogus(url: str, headers: dict | None = None) -> str:
     return xbogus
 
 
+def extract_reflow_reference(redirect_url) -> tuple:
+    """Return (room_id, sec_user_id) parsed from a webcast reflow redirect URL.
+
+    抖音新版分享链接可能不带 sec_user_id（或为空值），而 reflow/info 接口允许
+    sec_user_id 为空，因此这里只要求能取到 room_id：优先取查询串里的 room_id=，
+    否则取路径末尾的数字段。
+    """
+    text = str(redirect_url)
+    match = re.search(r'[?&]room_id=(\d+)', text)
+    if match:
+        room_id = match.group(1)
+    else:
+        room_id = text.split('?')[0].rstrip('/').rsplit('/', maxsplit=1)[-1]
+        room_id = room_id if room_id.isdigit() else ''
+    sec_match = re.search(r'sec_user_id=([\w_\-]+)', text)
+    return room_id, (sec_match.group(1) if sec_match else '')
+
+
 # 获取房间ID和用户secID
 async def get_sec_user_id(url: str, proxy_addr: str | None = None, headers: dict | None = None) -> tuple | None:
     if not headers or all(k.lower() not in ['user-agent', 'cookie'] for k in headers):
@@ -59,13 +77,10 @@ async def get_sec_user_id(url: str, proxy_addr: str | None = None, headers: dict
             response = await client.get(url, headers=headers, follow_redirects=True)
             redirect_url = response.url
             if 'reflow/' in str(redirect_url):
-                match = re.search(r'sec_user_id=([\w_\-]+)&', str(redirect_url))
-                if match:
-                    sec_user_id = match.group(1)
-                    room_id = str(redirect_url).split('?')[0].rsplit('/', maxsplit=1)[1]
+                room_id, sec_user_id = extract_reflow_reference(redirect_url)
+                if room_id:
                     return room_id, sec_user_id
-                else:
-                    raise RuntimeError("Could not find sec_user_id in the URL.")
+                raise RuntimeError("Could not find room_id in the redirect URL.")
             else:
                 raise UnsupportedUrlError("The redirect URL does not contain 'reflow/'.")
     except UnsupportedUrlError as e:

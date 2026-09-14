@@ -95,6 +95,16 @@ class RoomOffline(RuntimeError):
         }
 
 
+DOUYIN_LIVE_HOST = re.compile(r"https?://live\.douyin\.com/(\d+)", re.IGNORECASE)
+# 抖音会按入口改路径：follow/live（关注页）、root/live（新版分享/推荐卡片）都带房间号。
+DOUYIN_LIVE_PATH = re.compile(r"https?://(?:[\w\-]+\.)?douyin\.com/(?:[^?#]*/)?live/(\d+)", re.IGNORECASE)
+# 直播分享链接/接口链接会把房间号放在查询参数里：
+#   ?room_id=<19 位>            webcast reflow 链接
+#   ?live_web_rid=<web_rid>     live.douyin.com/?live_web_rid=... 分享链接
+DOUYIN_ROOM_ID_PARAM = re.compile(r"[?&]room_id=(\d+)", re.IGNORECASE)
+DOUYIN_WEB_RID_PARAM = re.compile(r"[?&]live_web_rid=(\d+)", re.IGNORECASE)
+
+
 def _douyin_digits_kind(digits):
     if len(digits) > DOUYIN_WEB_RID_MAX_DIGITS:
         return "room_id", digits
@@ -102,16 +112,19 @@ def _douyin_digits_kind(digits):
 
 
 def douyin_room_reference(url):
-    """Classify a Douyin link into ("web_rid"|"room_id"|"app", value)."""
+    """Classify a Douyin link into ("web_rid"|"room_id"|"app", value).
+
+    live.douyin.com/<web_rid>            -> web 接口（12 位 web_rid）
+    douyin.com/root|follow/live/<id>     -> 12 位走 web 接口，19 位走 app reflow
+    ...?room_id=<id>                     -> 同上，按位数判断
+    ...?live_web_rid=<web_rid>           -> web 接口（分享链接）
+    v.douyin.com/<短码>、douyin.com/user/<sec_uid> -> app 分享/主页链接
+    """
     text = (url or "").strip()
-    follow_match = re.search(r"https?://(?:www\.)?douyin\.com/follow/live/(\d+)", text)
-    if follow_match:
-        return _douyin_digits_kind(follow_match.group(1))
-    live_match = re.search(r"https?://live\.douyin\.com/(\d+)", text)
-    if live_match:
-        return _douyin_digits_kind(live_match.group(1))
-    # App share links (v.douyin.com/...) and profile links (douyin.com/user/...)
-    # are resolved through the app endpooints by the resolver itself.
+    for pattern in (DOUYIN_ROOM_ID_PARAM, DOUYIN_WEB_RID_PARAM, DOUYIN_LIVE_PATH, DOUYIN_LIVE_HOST):
+        match = pattern.search(text)
+        if match:
+            return _douyin_digits_kind(match.group(1))
     return "app", text
 
 
