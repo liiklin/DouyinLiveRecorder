@@ -94,6 +94,41 @@ class SidecarTest(unittest.TestCase):
         self.assertEqual(captured["exit"], sidecar.EXIT_FAILURE)
         self.assertEqual(captured["payload"], {"state": sidecar.STATE_ERROR, "message": "it triggered risk control"})
 
+    def test_serve_answers_each_request_in_order(self):
+        requests = io.StringIO('{"id":1,"platform":"douyin","url":"https://live.douyin.com/123"}\n'
+                               '{"id":2,"platform":"douyin","url":"https://live.douyin.com/124"}\n')
+        replies = io.StringIO()
+        original_resolve, original_stdout = sidecar.resolve_stream, sidecar.PROTOCOL_STDOUT
+        sidecar.resolve_stream = lambda platform, url, quality, proxy, cookies: (
+            {"state": sidecar.STATE_OFFLINE, "message": "room is not live"} if url.endswith("123")
+            else {"state": sidecar.STATE_LIVE, "streamUrl": "https://stream.example/live.m3u8"})
+        sidecar.PROTOCOL_STDOUT = replies
+        try:
+            code = sidecar.serve(requests, replies)
+        finally:
+            sidecar.resolve_stream, sidecar.PROTOCOL_STDOUT = original_resolve, original_stdout
+
+        lines = [json.loads(line) for line in replies.getvalue().splitlines() if line.strip()]
+        self.assertEqual(code, sidecar.EXIT_OK)
+        self.assertEqual([line["id"] for line in lines], [1, 2])
+        self.assertEqual(lines[0]["state"], sidecar.STATE_OFFLINE)
+        self.assertEqual(lines[1]["streamUrl"], "https://stream.example/live.m3u8")
+
+    def test_serve_survives_bad_requests_and_stops_on_quit(self):
+        requests = io.StringIO('oops\n{"id":7,"platform":"douyin","url":"https://live.douyin.com/7"}\n{"command":"quit"}\n')
+        replies = io.StringIO()
+        original_resolve = sidecar.resolve_stream
+        sidecar.resolve_stream = lambda platform, url, quality, proxy, cookies: {"state": sidecar.STATE_OFFLINE}
+        try:
+            sidecar.serve(requests, replies)
+        finally:
+            sidecar.resolve_stream = original_resolve
+
+        lines = [json.loads(line) for line in replies.getvalue().splitlines() if line.strip()]
+        self.assertEqual(lines[0]["state"], sidecar.STATE_ERROR)
+        self.assertEqual(lines[1]["id"], 7)
+        self.assertEqual(len(lines), 2)
+
     def run_main(self, resolve_stream):
         original_resolve, original_stdout = sidecar.resolve_stream, sidecar.PROTOCOL_STDOUT
         buffer = io.StringIO()

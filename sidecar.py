@@ -192,30 +192,77 @@ def error_message(exc):
     return message or exc.__class__.__name__
 
 
+def describe_resolution(platform, url, quality="", proxy_addr="", cookies="", config_path=""):
+    """Resolve one request and always return a protocol payload (never raises)."""
+    if config_path:
+        config_quality, config_cookies = config_credentials(config_path, platform)
+        quality = quality or config_quality
+        cookies = cookies or config_cookies
+    try:
+        return resolve_stream(platform, url, quality or "OD", proxy_addr, cookies)
+    except RoomOffline as exc:
+        return exc.payload()
+    except Exception as exc:  # noqa: BLE001 - never leak a traceback into the protocol
+        return {"state": STATE_ERROR, "message": error_message(exc)}
+
+
+def serve(stdin=None, stdout=None):
+    """常驻模式：stdin 每行一个 JSON 请求，stdout 每行一个 JSON 应答。
+
+    客户端因此不必每次轮询都重新启动这个（PyInstaller 打包的）可执行文件。
+    stdin 读到 EOF 就退出，所以宿主进程被强杀也不会留下孤儿进程。
+    """
+    stdin = stdin if stdin is not None else sys.stdin
+    stdout = stdout if stdout is not None else PROTOCOL_STDOUT
+
+    def reply(payload):
+        print(json.dumps(payload, ensure_ascii=False), file=stdout, flush=True)
+
+    for raw_line in stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except ValueError:
+            reply({"state": STATE_ERROR, "message": "invalid request line"})
+            continue
+        if not isinstance(request, dict):
+            reply({"state": STATE_ERROR, "message": "invalid request payload"})
+            continue
+        if request.get("command") == "quit":
+            break
+        payload = describe_resolution(
+            request.get("platform", ""),
+            request.get("url", ""),
+            request.get("quality", ""),
+            request.get("proxyAddr", ""),
+            request.get("cookies", ""),
+            request.get("config", ""),
+        )
+        if "id" in request:
+            payload = {"id": request["id"], **payload}
+        reply(payload)
+    return EXIT_OK
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("resolve-stream")
-    parser.add_argument("--platform", choices=("douyin", "kuaishou"), required=True)
-    parser.add_argument("--url", required=True)
+    parser.add_argument("command", choices=("resolve-stream", "serve"))
+    parser.add_argument("--platform", choices=("douyin", "kuaishou"))
+    parser.add_argument("--url", default="")
     parser.add_argument("--quality", default="")
     parser.add_argument("--proxy-addr", default="")
     parser.add_argument("--cookies", default="")
     parser.add_argument("--config", default="")
     args = parser.parse_args(argv)
-    config_quality, config_cookies = config_credentials(args.config, args.platform)
-    quality = args.quality or config_quality
-    cookies = args.cookies or config_cookies
-    try:
-        payload = resolve_stream(args.platform, args.url, quality, args.proxy_addr, cookies)
-    except RoomOffline as exc:
-        print(json.dumps(exc.payload(), ensure_ascii=False), file=PROTOCOL_STDOUT)
-        return EXIT_OK
-    except Exception as exc:  # noqa: BLE001 - single-line protocol error, no traceback
-        print(json.dumps({"state": STATE_ERROR, "message": error_message(exc)}, ensure_ascii=False),
-              file=PROTOCOL_STDOUT)
-        return EXIT_FAILURE
+    if args.command == "serve":
+        return serve()
+    if not args.platform or not args.url:
+        parser.error("resolve-stream requires --platform and --url")
+    payload = describe_resolution(args.platform, args.url, args.quality, args.proxy_addr, args.cookies, args.config)
     print(json.dumps(payload, ensure_ascii=False), file=PROTOCOL_STDOUT)
-    return EXIT_OK
+    return EXIT_OK if payload.get("state") != STATE_ERROR else EXIT_FAILURE
 
 
 if __name__ == "__main__":
