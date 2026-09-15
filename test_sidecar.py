@@ -70,6 +70,33 @@ class SidecarTest(unittest.TestCase):
             ("7685183051802151680", "MS4wLjABAAAA-x"),
         )
 
+    def test_normalizes_kuaishou_profile_links(self):
+        cases = {
+            "https://live.kuaishou.com/profile/3xqzmygz5zsvmd6": "https://live.kuaishou.com/u/3xqzmygz5zsvmd6",
+            "https://live.kuaishou.com/u/3xqzmygz5zsvmd6": "https://live.kuaishou.com/u/3xqzmygz5zsvmd6",
+        }
+
+        for url, expected in cases.items():
+            self.assertEqual(sidecar.normalize_kuaishou_url(url), expected, url)
+
+    def test_unparsable_kuaishou_link_reports_readable_error(self):
+        from src import spider
+
+        async def fake_stream_data(**kwargs):
+            # 解析库在链接形态不支持/房间不存在时只返回这个（没有 anchor_name）
+            return {"type": 1, "is_live": False}
+
+        original = spider.get_kuaishou_stream_data
+        spider.get_kuaishou_stream_data = fake_stream_data
+        try:
+            payload = sidecar.describe_resolution("kuaishou", "https://live.kuaishou.com/u/not-a-real-user")
+        finally:
+            spider.get_kuaishou_stream_data = original
+
+        self.assertEqual(payload["state"], sidecar.STATE_ERROR)
+        self.assertIn("未能解析该快手直播间", payload["message"])
+        self.assertNotIn("anchor_name", payload["message"])
+
     def test_normalize_douyin_url_returns_bare_room_reference(self):
         self.assertEqual(
             sidecar.normalize_douyin_url("https://www.douyin.com/follow/live/7685183051802151680?anchor_id=1"),

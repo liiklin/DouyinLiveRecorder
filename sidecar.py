@@ -136,6 +136,18 @@ def normalize_douyin_url(url):
     return f"https://live.douyin.com/{value}"
 
 
+KUAISHOU_PROFILE_PATTERN = re.compile(r"https?://live\.kuaishou\.com/profile/([\w-]+)", re.IGNORECASE)
+
+
+def normalize_kuaishou_url(url):
+    """快手主页链接（/profile/<主播号>）等非直播间地址统一成直播间地址（/u/<主播号>）。"""
+    text = (url or "").strip()
+    match = KUAISHOU_PROFILE_PATTERN.match(text)
+    if match:
+        return f"https://live.kuaishou.com/u/{match.group(1)}"
+    return text
+
+
 def stream_response(stream_info):
     if not stream_info.get("is_live"):
         raise RoomOffline("room is not live", stream_info)
@@ -166,7 +178,14 @@ def resolve_stream(platform, url, quality="OD", proxy_addr="", cookies=""):
                 url=value, proxy_addr=proxy_addr, cookies=cookies))
         stream_info = asyncio.run(stream.get_douyin_stream_url(data, quality, proxy_addr))
     elif platform == "kuaishou":
-        data = asyncio.run(spider.get_kuaishou_stream_data(url=url, proxy_addr=proxy_addr, cookies=cookies))
+        data = asyncio.run(spider.get_kuaishou_stream_data(
+            url=normalize_kuaishou_url(url), proxy_addr=proxy_addr, cookies=cookies))
+        if not data.get("is_live") and not data.get("anchor_name"):
+            # 解析库在链接形态不支持/房间不存在时只返回 {"type": 1, "is_live": False}，
+            # 继续往下会漏出 KeyError('anchor_name')，这里换成可读提示。
+            raise RuntimeError(
+                "未能解析该快手直播间：链接形态不受支持或房间不存在"
+                "（请使用直播间分享链接，或 live.kuaishou.com/u/<主播号>）")
         stream_info = asyncio.run(stream.get_kuaishou_stream_url(data, quality))
     else:
         raise RuntimeError(f"unsupported platform: {platform}")
