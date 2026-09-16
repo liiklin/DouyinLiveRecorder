@@ -79,23 +79,45 @@ class SidecarTest(unittest.TestCase):
         for url, expected in cases.items():
             self.assertEqual(sidecar.normalize_kuaishou_url(url), expected, url)
 
-    def test_unparsable_kuaishou_link_reports_readable_error(self):
+    def test_kuaishou_page_error_is_offline_with_diagnostics(self):
+        # 页面错误文案既可能是"房间不存在"，也可能是"被限流/需要验证"（同一真实房间
+        # 两种都遇到过），所以按未开播处理，只把平台原话留在 message 里供排查。
         from src import spider
 
         async def fake_stream_data(**kwargs):
-            # 解析库在链接形态不支持/房间不存在时只返回这个（没有 anchor_name）
-            return {"type": 1, "is_live": False}
+            return {"type": 2, "is_live": False}
 
-        original = spider.get_kuaishou_stream_data
+        original_data = spider.get_kuaishou_stream_data
+        original_page_error = sidecar.kuaishou_page_error
         spider.get_kuaishou_stream_data = fake_stream_data
+        sidecar.kuaishou_page_error = lambda url, proxy_addr="", cookies="": "错误代码22 浏览其他内容"
         try:
             payload = sidecar.describe_resolution("kuaishou", "https://live.kuaishou.com/u/not-a-real-user")
         finally:
-            spider.get_kuaishou_stream_data = original
+            spider.get_kuaishou_stream_data = original_data
+            sidecar.kuaishou_page_error = original_page_error
 
-        self.assertEqual(payload["state"], sidecar.STATE_ERROR)
-        self.assertIn("未能解析该快手直播间", payload["message"])
-        self.assertNotIn("anchor_name", payload["message"])
+        self.assertEqual(payload["state"], sidecar.STATE_OFFLINE, payload)
+        self.assertIn("平台返回：错误代码22", payload["message"])
+
+    def test_kuaishou_ended_live_page_error_is_offline(self):
+        # 页面说"直播已结束/回放"：这是正常状态，监控继续等下一场。
+        from src import spider
+
+        async def fake_stream_data(**kwargs):
+            return {"type": 2, "is_live": False}
+
+        original_data = spider.get_kuaishou_stream_data
+        original_page_error = sidecar.kuaishou_page_error
+        spider.get_kuaishou_stream_data = fake_stream_data
+        sidecar.kuaishou_page_error = lambda url, proxy_addr="", cookies="": "直播已结束 查看回放"
+        try:
+            payload = sidecar.describe_resolution("kuaishou", "https://live.kuaishou.com/u/3x5u9wyekgkcryw")
+        finally:
+            spider.get_kuaishou_stream_data = original_data
+            sidecar.kuaishou_page_error = original_page_error
+
+        self.assertEqual(payload["state"], sidecar.STATE_OFFLINE, payload)
 
     def test_normalize_douyin_url_returns_bare_room_reference(self):
         self.assertEqual(
@@ -173,3 +195,65 @@ class SidecarTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_kuaishou_offline_room_reports_offline_not_an_error(self):
+        # 解析库对"没在播 / 被风控挡一次"返回 {"type": 1, "is_live": False}（无主播名）。
+        # 链接形态正确时必须落到"未开播"，否则监控会把它显示成"解析失败"。
+        import src.spider as spider_module
+        import src.stream as stream_module
+
+        saved_spider = spider_module.get_kuaishou_stream_data
+        saved_stream = stream_module.get_kuaishou_stream_url
+
+        async def fake_spider(url, proxy_addr=None, cookies=None):
+            return {"type": 1, "is_live": False}
+
+        async def fake_stream(data, quality):
+            return {"is_live": False}
+
+        spider_module.get_kuaishou_stream_data = fake_spider
+        stream_module.get_kuaishou_stream_url = fake_stream
+        try:
+            payload = sidecar.describe_resolution("kuaishou", "https://live.kuaishou.com/u/3x5u9wyekgkcryw")
+        finally:
+            spider_module.get_kuaishou_stream_data = saved_spider
+            stream_module.get_kuaishou_stream_url = saved_stream
+
+        self.assertEqual(payload["state"], sidecar.STATE_OFFLINE, payload)
+
+    def test_kuaishou_unsupported_link_still_reports_an_error(self):
+        import src.spider as spider_module
+        import src.stream as stream_module
+
+        saved_spider = spider_module.get_kuaishou_stream_data
+        saved_stream = stream_module.get_kuaishou_stream_url
+
+        async def fake_spider(url, proxy_addr=None, cookies=None):
+            return {"type": 1, "is_live": False}
+
+        async def fake_stream(data, quality):
+            return {"is_live": False}
+
+        spider_module.get_kuaishou_stream_data = fake_spider
+        stream_module.get_kuaishou_stream_url = fake_stream
+        try:
+            payload = sidecar.describe_resolution("kuaishou", "https://example.com/3x5u9wyekgkcryw")
+        finally:
+            spider_module.get_kuaishou_stream_data = saved_spider
+            stream_module.get_kuaishou_stream_url = saved_stream
+
+        self.assertEqual(payload["state"], sidecar.STATE_ERROR, payload)
+        self.assertIn("链接形态不受支持", payload["message"])
+
+    def test_classifies_supported_platform_links(self):
+        self.assertTrue(sidecar.kuaishou_link_supported("https://live.kuaishou.com/u/3x5u9wyekgkcryw"))
+        self.assertTrue(sidecar.kuaishou_link_supported("https://live.kuaishou.com/profile/3x5u9wyekgkcryw"))
+        self.assertTrue(sidecar.kuaishou_link_supported("https://v.kuaishou.com/abc123"))
+        self.assertFalse(sidecar.kuaishou_link_supported("https://example.com/u/3x5u9wyekgkcryw"))
+        self.assertFalse(sidecar.kuaishou_link_supported(""))
+
+        self.assertTrue(sidecar.douyin_link_supported("https://live.douyin.com/?live_web_rid=154756259948"))
+        self.assertTrue(sidecar.douyin_link_supported("https://v.douyin.com/iRnBho6u/"))
+        self.assertTrue(sidecar.douyin_link_supported("https://www.douyin.com/user/MS4wLjABAAAA"))
+        self.assertFalse(sidecar.douyin_link_supported("https://example.com/room/1"))
+        self.assertFalse(sidecar.douyin_link_supported(""))

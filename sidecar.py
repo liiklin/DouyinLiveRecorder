@@ -137,6 +137,62 @@ def normalize_douyin_url(url):
 
 
 KUAISHOU_PROFILE_PATTERN = re.compile(r"https?://live\.kuaishou\.com/profile/([\w-]+)", re.IGNORECASE)
+# 我方支持解析的快手直播间/主页地址（其余形态才该报"链接形态不受支持"）。
+KUAISHOU_ROOM_PATTERN = re.compile(r"https?://(?:live\.)?kuaishou\.com/(?:u|profile)/[\w-]+", re.IGNORECASE)
+KUAISHOU_SHARE_PATTERN = re.compile(r"https?://(?:v|www)\.kuaishou\.com/", re.IGNORECASE)
+# 抖音的分享/主页链接（v.douyin.com、douyin.com/user/...）：解析库认得，只是没在播。
+DOUYIN_SHARE_PATTERN = re.compile(r"https?://(?:v\.)?douyin\.com/", re.IGNORECASE)
+
+
+def kuaishou_link_supported(url):
+    """链接形态是否是我方支持解析的快手地址（直播间/主页/分享短链）。"""
+    text = (url or "").strip()
+    if not text:
+        return False
+    return bool(KUAISHOU_ROOM_PATTERN.match(text) or KUAISHOU_SHARE_PATTERN.match(text))
+
+
+def kuaishou_page_error(url, proxy_addr="", cookies=""):
+    """取快手房间页自身给出的 errorType 文本（标题+说明），取不到返回 ""。
+
+    解析库只在页面是错误页时返回没有主播名的 is_live=False，而"错误页"既可能是
+    "房间不存在"，也可能是"直播已结束/未开播"。把页面原话取回来才能区分。
+    """
+    try:
+        from src import spider
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
+            "Accept-Language": "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2",
+        }
+        if cookies:
+            headers["Cookie"] = cookies
+        html_str = asyncio.run(spider.async_req(url=url, proxy_addr=proxy_addr, headers=headers))
+    except Exception:  # noqa: BLE001 - 取不到就当作"没说"
+        return ""
+    block = re.search(r'"errorType"\s*:\s*\{(.*?)\}', html_str, re.DOTALL)
+    if not block:
+        return ""
+    parts = []
+    for key in ("title", "content"):
+        found = re.search(r'"' + key + r'"\s*:\s*"([^"]*)"', block.group(1))
+        if found and found.group(1).strip():
+            parts.append(found.group(1).strip())
+    return " ".join(parts)
+
+
+
+def douyin_link_supported(url):
+    """链接形态是否是我方支持解析的抖音地址。
+
+    直播间引用（web_rid/room_id）必然可解析；"app" 形态里只有分享/主页链接算支持，
+    其余（例如随手粘的一段文字）才该报解析失败。
+    """
+    text = (url or "").strip()
+    if not text:
+        return False
+    if douyin_room_reference(text)[0] != "app":
+        return True
+    return bool(DOUYIN_SHARE_PATTERN.match(text))
 
 
 def normalize_kuaishou_url(url):
@@ -178,18 +234,36 @@ def resolve_stream(platform, url, quality="OD", proxy_addr="", cookies=""):
                 url=value, proxy_addr=proxy_addr, cookies=cookies))
         stream_info = asyncio.run(stream.get_douyin_stream_url(data, quality, proxy_addr))
     elif platform == "kuaishou":
+        kuaishou_url = normalize_kuaishou_url(url)
         data = asyncio.run(spider.get_kuaishou_stream_data(
-            url=normalize_kuaishou_url(url), proxy_addr=proxy_addr, cookies=cookies))
+            url=kuaishou_url, proxy_addr=proxy_addr, cookies=cookies))
         if not data.get("is_live") and not data.get("anchor_name"):
-            # 解析库在链接形态不支持/房间不存在时只返回 {"type": 1, "is_live": False}，
-            # 继续往下会漏出 KeyError('anchor_name')，这里换成可读提示。
-            raise RuntimeError(
-                "未能解析该快手直播间：链接形态不受支持或房间不存在"
-                "（请使用直播间分享链接，或 live.kuaishou.com/u/<主播号>）")
+            # 解析库对"没在播 / 刚被风控挡了一次 / 房间不存在"都返回
+            # {"type": 1|2, "is_live": False}（没有 anchor_name，继续往下会漏出
+            # KeyError），所以这里得自己区分"没在播"和"链接/房间确实不行"。
+            if not kuaishou_link_supported(kuaishou_url):
+                raise RuntimeError(
+                    "未能解析该快手直播间：链接形态不受支持"
+                    "（请使用直播间分享链接，或 live.kuaishou.com/u/<主播号>）")
+            if data.get("type") == 2:
+                # 页面自己给了错误文案。注意：实测"错误代码22 浏览其他内容"这类
+                # 既出现在房间不存在时，也出现在被限流/需要验证时（同一个真实房间
+                # 两种都遇到过），所以不能据此报解析失败——按未开播处理，把平台原话
+                # 放进 message 供排查，UI 上显示的是正常的"未开播"。
+                page_error = kuaishou_page_error(kuaishou_url, proxy_addr, cookies)
+                if page_error:
+                    raise RoomOffline(f"room is not live (平台返回：{page_error})", data)
+            # type == 1（抓取/解析失败，多半是限流或网络抖动）以及"没在播"的页面：
+            # 都按未开播处理，监控下一轮继续重试，不再显示成解析失败。
+            raise RoomOffline("room is not live", data)
         stream_info = asyncio.run(stream.get_kuaishou_stream_url(data, quality))
     else:
         raise RuntimeError(f"unsupported platform: {platform}")
     if not stream_info.get("is_live") and not stream_info.get("anchor_name"):
+        # 同快手：链接形态认得出来，就说明只是没在播（或解析被挡了一次），
+        # 属于正常监控状态，不该报解析失败。
+        if douyin_link_supported(url):
+            raise RoomOffline("room is not live", stream_info)
         raise RuntimeError("failed to resolve live stream (possibly invalid cookies or URL)")
     return stream_response(stream_info)
 
