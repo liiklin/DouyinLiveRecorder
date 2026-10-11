@@ -140,8 +140,9 @@ KUAISHOU_PROFILE_PATTERN = re.compile(r"https?://live\.kuaishou\.com/profile/([\
 # 我方支持解析的快手直播间/主页地址（其余形态才该报"链接形态不受支持"）。
 KUAISHOU_ROOM_PATTERN = re.compile(r"https?://(?:live\.)?kuaishou\.com/(?:u|profile)/[\w-]+", re.IGNORECASE)
 KUAISHOU_SHARE_PATTERN = re.compile(r"https?://(?:v|www)\.kuaishou\.com/", re.IGNORECASE)
+XHS_LINK_PATTERN = re.compile(r"https?://(?:www\.)?xiaohongshu\.com/|https?://xhslink\.com/", re.IGNORECASE)
 # 抖音的分享/主页链接（v.douyin.com、douyin.com/user/...）：解析库认得，只是没在播。
-DOUYIN_SHARE_PATTERN = re.compile(r"https?://(?:v\.)?douyin\.com/", re.IGNORECASE)
+DOUYIN_SHARE_PATTERN = re.compile(r"https?://(?:[\w\-]+\.)?douyin\.com/", re.IGNORECASE)
 
 
 def kuaishou_link_supported(url):
@@ -179,6 +180,11 @@ def kuaishou_page_error(url, proxy_addr="", cookies=""):
             parts.append(found.group(1).strip())
     return " ".join(parts)
 
+
+
+def xhs_link_supported(url):
+    """小红书直播间链接：www.xiaohongshu.com 页面或 xhslink.com 分享短链。"""
+    return bool(XHS_LINK_PATTERN.match(url.strip()))
 
 
 def douyin_link_supported(url):
@@ -257,12 +263,17 @@ def resolve_stream(platform, url, quality="OD", proxy_addr="", cookies=""):
             # 都按未开播处理，监控下一轮继续重试，不再显示成解析失败。
             raise RoomOffline("room is not live", data)
         stream_info = asyncio.run(stream.get_kuaishou_stream_url(data, quality))
+    elif platform == "xiaohongshu":
+        # get_xhs_stream_url 直接返回 stream_info 结构（is_live / anchor_name / title /
+        # record_url / m3u8_url / flv_url），无需像抖音快手那样再走 stream.get_*_stream_url。
+        stream_info = asyncio.run(spider.get_xhs_stream_url(
+            url=url, proxy_addr=proxy_addr, cookies=cookies))
     else:
         raise RuntimeError(f"unsupported platform: {platform}")
     if not stream_info.get("is_live") and not stream_info.get("anchor_name"):
         # 同快手：链接形态认得出来，就说明只是没在播（或解析被挡了一次），
         # 属于正常监控状态，不该报解析失败。
-        if douyin_link_supported(url):
+        if douyin_link_supported(url) or xhs_link_supported(url):
             raise RoomOffline("room is not live", stream_info)
         raise RuntimeError("failed to resolve live stream (possibly invalid cookies or URL)")
     return stream_response(stream_info)
@@ -276,7 +287,8 @@ def config_credentials(config_path, platform):
     settings = config["录制设置"] if "录制设置" in config else {}
     quality_label = settings.get("原画|超清|高清|标清|流畅", "原画")
     quality = {"原画": "OD", "超清": "UHD", "高清": "HD", "标清": "SD", "流畅": "LD"}.get(quality_label, "OD")
-    cookies = config["Cookie"].get("抖音cookie" if platform == "douyin" else "快手cookie", "") if "Cookie" in config else ""
+    cookie_key = {"douyin": "抖音cookie", "kuaishou": "快手cookie", "xiaohongshu": "小红书cookie"}.get(platform, "")
+    cookies = config["Cookie"].get(cookie_key, "") if "Cookie" in config and cookie_key else ""
     return quality, cookies
 
 
@@ -342,7 +354,7 @@ def serve(stdin=None, stdout=None):
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("resolve-stream", "serve"))
-    parser.add_argument("--platform", choices=("douyin", "kuaishou"))
+    parser.add_argument("--platform", choices=("douyin", "kuaishou", "xiaohongshu"))
     parser.add_argument("--url", default="")
     parser.add_argument("--quality", default="")
     parser.add_argument("--proxy-addr", default="")

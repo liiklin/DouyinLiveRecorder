@@ -1,6 +1,7 @@
 import io
 import json
 import unittest
+from unittest import mock
 
 import sidecar
 
@@ -193,9 +194,6 @@ class SidecarTest(unittest.TestCase):
         return {"exit": exit_code, "payload": json.loads(lines[0])}
 
 
-if __name__ == "__main__":
-    unittest.main()
-
     def test_kuaishou_offline_room_reports_offline_not_an_error(self):
         # 解析库对"没在播 / 被风控挡一次"返回 {"type": 1, "is_live": False}（无主播名）。
         # 链接形态正确时必须落到"未开播"，否则监控会把它显示成"解析失败"。
@@ -257,3 +255,41 @@ if __name__ == "__main__":
         self.assertTrue(sidecar.douyin_link_supported("https://www.douyin.com/user/MS4wLjABAAAA"))
         self.assertFalse(sidecar.douyin_link_supported("https://example.com/room/1"))
         self.assertFalse(sidecar.douyin_link_supported(""))
+
+    def test_classifies_xhs_links(self):
+        self.assertTrue(sidecar.xhs_link_supported("https://www.xiaohongshu.com/user/profile/6330049c000000002303c7ed"))
+        self.assertTrue(sidecar.xhs_link_supported("http://xhslink.com/a/abc123"))
+        self.assertTrue(sidecar.xhs_link_supported("https://www.xiaohongshu.com/explore"))
+        self.assertFalse(sidecar.xhs_link_supported("https://example.com/user/profile/1"))
+        self.assertFalse(sidecar.xhs_link_supported(""))
+
+    def test_xhs_resolve_stream_returns_live_stream(self):
+        payload = {"anchor_name": "娜娜", "is_live": True, "title": "直播标题",
+                   "record_url": "http://live-source-play.xhscdn.com/live/123.flv",
+                   "m3u8_url": "http://live-source-play.xhscdn.com/live/123.m3u8"}
+        with mock.patch("src.spider.get_xhs_stream_url", new=mock.AsyncMock(return_value=payload)):
+            result = sidecar.resolve_stream("xiaohongshu", "https://www.xiaohongshu.com/user/profile/6330049c000000002303c7ed")
+        self.assertEqual(result["state"], sidecar.STATE_LIVE)
+        self.assertEqual(result["streamUrl"], "http://live-source-play.xhscdn.com/live/123.flv")
+        self.assertEqual(result["streamerName"], "娜娜")
+
+    def test_xhs_offline_room_reports_offline(self):
+        payload = {"anchor_name": "娜娜", "is_live": False}
+        with mock.patch("src.spider.get_xhs_stream_url", new=mock.AsyncMock(return_value=payload)):
+            with self.assertRaises(sidecar.RoomOffline):
+                sidecar.resolve_stream("xiaohongshu", "https://www.xiaohongshu.com/user/profile/6330049c000000002303c7ed")
+
+    def test_xhs_config_credentials_reads_cookie(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.ini")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("[录制设置]\n原画|超清|高清|标清|流畅=超清\n\n[Cookie]\n小红书cookie=web_session=abc; a1=xyz\n")
+            quality, cookies = sidecar.config_credentials(path, "xiaohongshu")
+        self.assertEqual(quality, "UHD")
+        self.assertEqual(cookies, "web_session=abc; a1=xyz")
+
+
+if __name__ == "__main__":
+    unittest.main()
